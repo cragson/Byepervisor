@@ -4,12 +4,12 @@
 /*
  * Enable debug logging via TCP connection to PC
  */
-#define PC_DEBUG_ENABLED                    0
+#define PC_DEBUG_ENABLED                    1
 
 /*
  * PC IP address for debug logging
  */
-#define PC_DEBUG_IP                         "10.0.0.143"
+#define PC_DEBUG_IP                         "192.168.4.205"
 
 /*
  * PC IP port for debug logging

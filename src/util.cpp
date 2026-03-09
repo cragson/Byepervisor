@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/cpuset.h>
 #include <unistd.h>
@@ -116,6 +117,57 @@ void DumpHex(const void* data, size_t size) {
     }
 
     SOCK_LOG("%s", hexbuf);
+}
+
+uint64_t find_pattern(const void *buf, size_t buf_size, const char *pattern)
+{
+    unsigned char needle[256];
+    unsigned char mask[256];
+    int needle_len = 0;
+
+    // Parse the pattern string into needle bytes and mask
+    const char *p = pattern;
+    while (*p) {
+        // Skip spaces
+        while (*p == ' ')
+            p++;
+        if (*p == '\0')
+            break;
+
+        if (*p == '?') {
+            needle[needle_len] = 0x00;
+            mask[needle_len] = 0;
+            needle_len++;
+            p++;
+            // Skip second '?' if present (e.g. "??")
+            if (*p == '?')
+                p++;
+        } else {
+            char hex[3] = { p[0], p[1], '\0' };
+            needle[needle_len] = (unsigned char)strtoul(hex, NULL, 16);
+            mask[needle_len] = 1;
+            needle_len++;
+            p += 2;
+        }
+    }
+
+    if (needle_len == 0 || (size_t)needle_len > buf_size)
+        return 0;
+
+    const unsigned char *data = (const unsigned char *)buf;
+    for (size_t i = 0; i <= buf_size - needle_len; i++) {
+        int found = 1;
+        for (int j = 0; j < needle_len; j++) {
+            if (mask[j] && data[i + j] != needle[j]) {
+                found = 0;
+                break;
+            }
+        }
+        if (found)
+            return (uint64_t)(i);
+    }
+
+    return 0;
 }
 
 int flash_notification(const char *fmt, ...)

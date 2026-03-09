@@ -1,7 +1,9 @@
 #ifndef UTIL_H
 #define UTIL_H
 
+#ifndef MAX
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
 
 // Core pinning
 int pin_to_core(int num);
@@ -16,6 +18,9 @@ uint32_t kernel_read4(uint64_t addr);
 
 // Dumping
 void DumpHex(const void* data, size_t size);
+
+// Pattern scanning
+uint64_t find_pattern(const void *buf, size_t buf_size, const char *pattern);
 
 // Notifications
 int flash_notification(const char *fmt, ...);

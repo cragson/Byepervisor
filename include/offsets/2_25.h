@@ -11,6 +11,8 @@ uint64_t g_sym_map_225[] = {
     0x1CDE5B0,          // KERNEL_SYM_PS4_SYSENT
     0x1CE6DD0,          // KERNEL_SYM_PPR_SYSENT
     0x0042000,          // KERNEL_SYM_GADGET_JMP_PTR_RSI
+    0x245b180,          // KERNEL_SYM_HV_JMP_TABLE
+    0x248ebb0,          // KERNEL_SYM_HIJACKED_JMP_PTR
 };
 
 uint64_t g_patch_map_225[] = {
@@ -18,6 +20,29 @@ uint64_t g_patch_map_225[] = {
     0x0580A90,          // KERNEL_PATCH_IS_ALLOWED_TO_MMAP_SELF
     0x09A64B9,          // KERNEL_PATCH_MMAP_SELF_CALL_IS_LOADABLE
     0x02A69F0,          // KERNEL_PATCH_SYS_GETGID
+};
+
+uint64_t g_gadget_map_225[] = {
+    0x103c4e,           // KERNEL_GADGET_RET
+    0x16aff2,           // KERNEL_GADGET_INFLOOP
+    0xadfbf0,           // KERNEL_GADGET_HYPERCALL_SET_CPUID_PS4
+    0xae025f,           // KERNEL_GADGET_RETURN_ADDR
+    0x1a6878,           // KERNEL_GADGET_POP_RDI
+    0x167430,           // KERNEL_GADGET_POP_RSI
+    0x1984e2,           // KERNEL_GADGET_POP_RDX
+    0x1c34d0,           // KERNEL_GADGET_POP_RAX
+    0x133166,           // KERNEL_GADGET_POP_RBX
+    0x201f99,           // KERNEL_GADGET_ADD_RAX_RDX
+    0x6729e7,           // KERNEL_GADGET_MOV_R9_QWORD_PTR_RDI_48
+    0x62ce51,           // KERNEL_GADGET_POP_R12
+    0x3b2ae6,           // KERNEL_GADGET_MOV_QWORD_PTR_RDI_RSI
+    0x14acb7,           // KERNEL_GADGET_POP_RSP
+    0x16b590,           // KERNEL_GADGET_MOV_RAX_QWORD_PTR_RAX
+    0x16b737,           // KERNEL_GADGET_MOV_QWORD_PTR_RAX_0
+    0x2488f0,           // KERNEL_GADGET_SETJMP
+    0x248920,           // KERNEL_GADGET_LONGJMP
+    0xb5d2bc,           // KERNEL_GADGET_JOP1
+    0x1d8c8f,           // KERNEL_GADGET_JOP2
 };
 
 #endif // OFFSETS_2_25_H

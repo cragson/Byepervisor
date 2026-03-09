@@ -17,9 +17,11 @@
 
 #define WORKER_THREAD_TAGGED_SIZE                   0x03FE
 
-int sceKernelSleep(int);
-
-void pthread_set_name_np(pthread_t, const char *);
+extern "C"
+{
+    int sceKernelSleep(int secs);
+    void pthread_set_name_np(pthread_t, const char *);
+}
 
 void *krop_worker_func(void *arg)
 {
@@ -47,7 +49,7 @@ void *krop_worker_func(void *arg)
     return NULL;
 }
 
-uint64_t find_thread_kstack(char *name)
+uint64_t find_thread_kstack(const char *name)
 {
     pid_t pid;
     uint64_t proc;

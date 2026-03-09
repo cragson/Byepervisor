@@ -112,3 +112,44 @@ uint64_t kdlsym(ksym_t sym)
 
     return 0;
 }
+
+uint64_t kdlgadget(kgadget_t gadget)
+{
+    // Init kdlsym if it's not initialized already
+    if (g_kernel_base == 0)
+        init_kdlsym();
+
+    // Don't overflow gadget table
+    if (gadget >= KERNEL_GADGET_MAX)
+        return 0;
+
+    switch (g_fw_version) {
+    case 0x1050000:
+        return g_kernel_base + g_gadget_map_105[gadget];
+    case 0x1100000:
+        return g_kernel_base + g_gadget_map_110[gadget];
+    case 0x1110000:
+        return g_kernel_base + g_gadget_map_111[gadget];
+    case 0x1120000:
+        return g_kernel_base + g_gadget_map_112[gadget];
+    case 0x1130000:
+        return g_kernel_base + g_gadget_map_113[gadget];
+    case 0x1140000:
+        return g_kernel_base + g_gadget_map_114[gadget];
+    case 0x2000000:
+        return g_kernel_base + g_gadget_map_200[gadget];
+    case 0x2200000:
+        return g_kernel_base + g_gadget_map_220[gadget];
+    case 0x2250000:
+        return g_kernel_base + g_gadget_map_225[gadget];
+    case 0x2260000:
+        return g_kernel_base + g_gadget_map_226[gadget];
+    case 0x2300000:
+        return g_kernel_base + g_gadget_map_230[gadget];
+    case 0x2500000:
+    case 0x2700000:
+        return g_kernel_base + g_gadget_map_250[gadget];
+    }
+
+    return 0;
+}
